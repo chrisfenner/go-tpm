@@ -9,10 +9,17 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/google/go-tpm/tpm2/transport"
 )
+
+// ResponseHMAC is the pair of nonce and HMAC provided by the TPM.
+type ResponseHMAC struct {
+	NonceTPM TPM2BNonce
+	TPMHMAC  TPM2BData
+}
 
 // Session represents a session in the TPM.
 type Session interface {
@@ -51,6 +58,8 @@ type Session interface {
 	Decrypt(parameter []byte) error
 	// Returns the handle value of this session.
 	Handle() TPMHandle
+	// Returns the last nonceTPM and HMAC associated with the session.
+	LastHMAC() (*ResponseHMAC, error)
 }
 
 // CPHash calculates the TPM command parameter hash for a given Command.
@@ -152,6 +161,11 @@ func (s *pwSession) Decrypt(_ []byte) error { return nil }
 // In the case of a password session, this is always TPM_RS_PW.
 func (s *pwSession) Handle() TPMHandle { return TPMRSPW }
 
+// LastHMAC implements the Session interface.
+func (s *pwSession) LastHMAC() (*ResponseHMAC, error) {
+	return nil, errors.New("not supported for Password sessions")
+}
+
 // cpHash calculates the TPM command parameter hash.
 // cpHash = hash(CC || names || parms)
 func cpHash(alg TPMIAlgHash, cc TPMCC, names []TPM2BName, parms []byte) ([]byte, error) {
@@ -168,9 +182,9 @@ func cpHash(alg TPMIAlgHash, cc TPMCC, names []TPM2BName, parms []byte) ([]byte,
 	return h.Sum(nil), nil
 }
 
-// rpHash calculates the TPM response parameter hash.
-// rpHash = hash(RC || CC || parms)
-func rpHash(alg TPMIAlgHash, rc TPMRC, cc TPMCC, parms []byte) ([]byte, error) {
+// RPHash calculates the TPM response parameter hash.
+// RPHash = hash(RC || CC || parms)
+func RPHash(alg TPMIAlgHash, rc TPMRC, cc TPMCC, parms []byte) ([]byte, error) {
 	ha, err := alg.Hash()
 	if err != nil {
 		return nil, err
@@ -184,13 +198,19 @@ func rpHash(alg TPMIAlgHash, rc TPMRC, cc TPMCC, parms []byte) ([]byte, error) {
 
 // sessionOptions represents extra options used when setting up an HMAC or policy session.
 type sessionOptions struct {
-	auth        []byte
-	password    bool
-	bindHandle  TPMIDHEntity
-	bindName    TPM2BName
-	bindAuth    []byte
-	saltHandle  TPMIDHObject
-	saltPub     TPMTPublic
+	auth       []byte
+	password   bool
+	bindHandle TPMIDHEntity
+	bindName   TPM2BName
+	bindAuth   []byte
+
+	saltHandle TPMIDHObject
+	saltPub    TPMTPublic
+
+	externalSalt  *TPM2BEncryptedSecret
+	externalNonce *TPM2BNonce
+	externalHMAC  []byte
+
 	attrs       TPMASession
 	symmetric   TPMTSymDef
 	trialPolicy bool
@@ -205,6 +225,23 @@ func defaultOptions() sessionOptions {
 		bindHandle: TPMRHNull,
 		saltHandle: TPMRHNull,
 	}
+}
+
+// ErrInvalidSessionOptions indicates that there was a problem with the
+// provided session options.
+var ErrInvalidSessionOptions = errors.New("invalid session options")
+
+// validate checks whether the options are internally consistent.
+func (opts *sessionOptions) validate() error {
+	if opts.externalSalt != nil {
+		if opts.bindHandle != TPMRHNull {
+			return errors.New("%w: cannot combine ExternallySalted with Bound")
+		}
+		if opts.symmetric.Algorithm != TPMAlgNull {
+			return errors.New("%$v cannot combine ExternallySalted with AESEncryption")
+		}
+	}
+	return nil
 }
 
 // AuthOption is an option for setting up an auth session variadically.
@@ -246,6 +283,20 @@ func Salted(handle TPMIDHObject, pub TPMTPublic) AuthOption {
 	return func(o *sessionOptions) {
 		o.saltHandle = handle
 		o.saltPub = pub
+	}
+}
+
+// ExternallySalted specifies that this session's session key should
+// depend on an externally-provided encrypted seed value. Because this
+// session cannot know the session key, HMACs with this session are not
+// checked locally.
+// This option cannot be combined with Bound or AESEncryption.
+func ExternallySalted(encryptedSecret *TPM2BEncryptedSecret, nonce *TPM2BNonce, hmac []byte, handle TPMHandle) AuthOption {
+	return func(o *sessionOptions) {
+		o.externalSalt = encryptedSecret
+		o.externalNonce = nonce
+		o.externalHMAC = hmac
+		o.saltHandle = handle
 	}
 }
 
@@ -323,6 +374,8 @@ type hmacSession struct {
 	nonceCaller TPM2BNonce
 	// last nonceTPM
 	nonceTPM TPM2BNonce
+	// last HMAC
+	lastTPMHMAC TPM2BData
 }
 
 // HMAC sets up a just-in-time HMAC session that is used only once.
@@ -459,9 +512,9 @@ func getEncryptedSaltECC(nameAlg TPMIAlgHash, parms *TPMSECCParms, pub *TPMSECCP
 	}, salt, nil
 }
 
-// getEncryptedSalt creates a salt value for salted sessions.
+// MakeEncryptedSalt creates a salt value for salted sessions.
 // Returns the encrypted salt and plaintext salt, or an error value.
-func getEncryptedSalt(pub TPMTPublic) (*TPM2BEncryptedSecret, []byte, error) {
+func MakeEncryptedSalt(pub TPMTPublic) (*TPM2BEncryptedSecret, []byte, error) {
 	switch pub.Type {
 	case TPMAlgRSA:
 		rsaParms, err := pub.Parameters.RSADetail()
@@ -495,13 +548,22 @@ func (s *hmacSession) Init(t transport.TPM) error {
 		return nil
 	}
 
-	// Get a high-quality nonceCaller for our use.
-	// Store it with the session object for later reference.
-	s.nonceCaller = TPM2BNonce{
-		Buffer: make([]byte, s.nonceSize),
-	}
-	if _, err := rand.Read(s.nonceCaller.Buffer); err != nil {
+	if err := s.sessionOptions.validate(); err != nil {
 		return err
+	}
+
+	if s.externalNonce == nil {
+		// Get a high-quality nonceCaller for our use.
+		// Store it with the session object for later reference.
+		s.nonceCaller = TPM2BNonce{
+			Buffer: make([]byte, s.nonceSize),
+		}
+		if _, err := rand.Read(s.nonceCaller.Buffer); err != nil {
+			return err
+		}
+	} else {
+		// Use the nonceCaller that was provided.
+		s.nonceCaller = *s.externalNonce
 	}
 
 	// Start up the actual auth session.
@@ -514,10 +576,13 @@ func (s *hmacSession) Init(t transport.TPM) error {
 		AuthHash:    s.hash,
 	}
 	var salt []byte
-	if s.saltHandle != TPMRHNull {
+
+	if s.externalSalt != nil {
+		sasCmd.EncryptedSalt = *s.externalSalt
+	} else if s.saltHandle != TPMRHNull {
 		var err error
 		var encSalt *TPM2BEncryptedSecret
-		encSalt, salt, err = getEncryptedSalt(s.saltPub)
+		encSalt, salt, err = MakeEncryptedSalt(s.saltPub)
 		if err != nil {
 			return err
 		}
@@ -586,7 +651,7 @@ func attrsToBytes(attrs TPMASession) []byte {
 	return []byte{res}
 }
 
-// computeHMAC computes an authorization HMAC according to various equations in
+// ComputeSessionHMAC computes an authorization HMAC according to various equations in
 // Part 1.
 // This applies to both commands and responses.
 // The value of key depends on whether the session is bound and/or salted.
@@ -596,7 +661,7 @@ func attrsToBytes(attrs TPMASession) []byte {
 // nonceOlder in a command is the last nonceTPM sent by the TPM for this session.
 // This may be when the session was created, or the last time it was used.
 // nonceOlder in a response is the corresponding nonceCaller sent in the command.
-func computeHMAC(alg TPMIAlgHash, key, pHash, nonceNewer, nonceOlder, addNonces []byte, attrs TPMASession) ([]byte, error) {
+func ComputeSessionHMAC(alg TPMIAlgHash, key, pHash, nonceNewer, nonceOlder, addNonces []byte, attrs TPMASession) ([]byte, error) {
 	ha, err := alg.Hash()
 	if err != nil {
 		return nil, err
@@ -635,6 +700,15 @@ func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2B
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
 	}
+	if s.externalSalt != nil {
+		// Can't authorize a command using external salt.
+		return &TPMSAuthCommand{
+			Handle:     s.handle,
+			Nonce:      s.nonceCaller,
+			Attributes: s.attrs,
+			// Empty authorization.
+		}, nil
+	}
 
 	// Part 1, 19.6
 	// HMAC key is (sessionKey || auth) unless this session is authorizing
@@ -650,9 +724,15 @@ func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2B
 	if err != nil {
 		return nil, err
 	}
-	hmac, err := computeHMAC(s.hash, hmacKey, cph, s.nonceCaller.Buffer, s.nonceTPM.Buffer, addNonces, s.attrs)
-	if err != nil {
-		return nil, err
+
+	var hmac []byte
+	if len(s.externalHMAC) != 0 {
+		hmac = s.externalHMAC
+	} else {
+		hmac, err = ComputeSessionHMAC(s.hash, hmacKey, cph, s.nonceCaller.Buffer, s.nonceTPM.Buffer, addNonces, s.attrs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	result := TPMSAuthCommand{
 		Handle:     s.handle,
@@ -668,11 +748,17 @@ func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2B
 // Validate validates the response session structure for the session.
 // It updates nonceTPM from the TPM's response.
 func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
+	// Track the new nonceTPM for the session as well as the HMAC.
 	s.nonceTPM = auth.Nonce
+	s.lastTPMHMAC = auth.Authorization
 	// Track the session being automatically flushed.
 	if !auth.Attributes.ContinueSession {
 		s.handle = TPMRHNull
+	}
+
+	// The session key is not knowable by us, so we can't check the HMAC.
+	if s.externalSalt != nil {
+		return nil
 	}
 
 	// Part 1, 19.6
@@ -685,11 +771,11 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	}
 
 	// Compute the authorization HMAC.
-	rph, err := rpHash(s.hash, rc, cc, parms)
+	rph, err := RPHash(s.hash, rc, cc, parms)
 	if err != nil {
 		return err
 	}
-	mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+	mac, err := ComputeSessionHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 	if err != nil {
 		return err
 	}
@@ -776,6 +862,14 @@ func (s *hmacSession) Decrypt(parameter []byte) error {
 // TPM_RH_NULL.
 func (s *hmacSession) Handle() TPMHandle {
 	return s.handle
+}
+
+// LastHMAC implements the Session interface.
+func (s *hmacSession) LastHMAC() (*ResponseHMAC, error) {
+	return &ResponseHMAC{
+		NonceTPM: s.nonceTPM,
+		TPMHMAC:  s.lastTPMHMAC,
+	}, nil
 }
 
 // PolicyCallback represents an object's policy in the form of a function.
@@ -883,7 +977,7 @@ func (s *policySession) Init(t transport.TPM) error {
 	if s.saltHandle != TPMRHNull {
 		var err error
 		var encSalt *TPM2BEncryptedSecret
-		encSalt, salt, err = getEncryptedSalt(s.saltPub)
+		encSalt, salt, err = MakeEncryptedSalt(s.saltPub)
 		if err != nil {
 			return err
 		}
@@ -963,7 +1057,7 @@ func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM
 		if err != nil {
 			return nil, err
 		}
-		hmac, err = computeHMAC(s.hash, hmacKey, cph, s.nonceCaller.Buffer, s.nonceTPM.Buffer, addNonces, s.attrs)
+		hmac, err = ComputeSessionHMAC(s.hash, hmacKey, cph, s.nonceCaller.Buffer, s.nonceTPM.Buffer, addNonces, s.attrs)
 		if err != nil {
 			return nil, err
 		}
@@ -1005,11 +1099,11 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 		hmacKey = append(hmacKey, s.sessionKey...)
 		hmacKey = append(hmacKey, hmacKeyFromAuthValue(s.auth)...)
 		// Compute the authorization HMAC.
-		rph, err := rpHash(s.hash, rc, cc, parms)
+		rph, err := RPHash(s.hash, rc, cc, parms)
 		if err != nil {
 			return err
 		}
-		mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+		mac, err := ComputeSessionHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 		if err != nil {
 			return err
 		}
@@ -1097,4 +1191,9 @@ func (s *policySession) Decrypt(parameter []byte) error {
 // TPM_RH_NULL.
 func (s *policySession) Handle() TPMHandle {
 	return s.handle
+}
+
+// LastHMAC implements the Session interface.
+func (s *policySession) LastHMAC() (*ResponseHMAC, error) {
+	return nil, errors.New("not supported for Policy sessions")
 }

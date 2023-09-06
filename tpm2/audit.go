@@ -83,5 +83,5 @@ func auditRPHash(cc TPMCC, h TPMIAlgHash, r any) ([]byte, error) {
 			return nil, fmt.Errorf("marshalling parameter %v: %w", i+1, err)
 		}
 	}
-	return rpHash(h, TPMRCSuccess, cc, parms.Bytes())
+	return RPHash(h, TPMRCSuccess, cc, parms.Bytes())
 }
