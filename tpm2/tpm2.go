@@ -624,6 +624,43 @@ type CertifyResponse struct {
 	Signature TPMTSignature
 }
 
+// CertifyX509 is the input to TPM2_CertifX509y.
+// See definition in Part 3, Commands, section 18.8.
+type CertifyX509 struct {
+	// handle of the object to be certified
+	ObjectHandle handle `gotpm:"handle,auth"`
+	// handle of the key used to sign the attestation structure
+	SignHandle handle `gotpm:"handle,auth"`
+	// shall be an Empty Buffer
+	Reserved TPM2BData
+	// signing scheme to use if the scheme for signHandle is TPM_ALG_NULL
+	InScheme TPMTSigScheme
+	// a DER encoded partial certificate
+	PartialCertificate TPM2BMaxBuffer
+}
+
+// Command implements the Command interface.
+func (CertifyX509) Command() TPMCC { return TPMCCCertifyX509 }
+
+// Execute executes the command and returns the response.
+func (cmd CertifyX509) Execute(t transport.TPM, s ...Session) (*CertifyX509Response, error) {
+	var rsp CertifyX509Response
+	if err := execute[CertifyX509Response](t, cmd, &rsp, s...); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// CertifyX509Response is the response from TPM2_CertifyX509.
+type CertifyX509Response struct {
+	// a DER encoded SEQUENCE containing the DER encoded fields added to partialCertificate to make it a complete RFC5280 TBSCertificate.
+	AddedToCertificate TPM2BMaxBuffer
+	// the digest that was signed
+	TBSDigest TPM2BDigest
+	// The signature over tbsDigest
+	Signature TPMTSignature
+}
+
 // CertifyCreation is the input to TPM2_CertifyCreation.
 // See definition in Part 3, Commands, section 18.3.
 type CertifyCreation struct {
